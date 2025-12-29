@@ -1,0 +1,156 @@
+name: Build LineageOS 16.0 Y560
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Maximize Build Space
+        uses: easimon/maximize-build-space@master
+        with:
+          root-reserve-mb: 2048
+          temp-reserve-mb: 100
+          remove-dotnet: 'true'
+          remove-android: 'true'
+
+      - name: Install System Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-linux-gnueabi g++-arm-linux-gnueabi \
+            binutils-arm-linux-gnueabi bc build-essential zip curl git openjdk-8-jdk \
+            python2 libssl-dev libncurses5 bison flex
+          sudo update-alternatives --install /usr/bin/python python /usr/bin/python2 1
+          mkdir -p ~/bin
+          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+          chmod a+x ~/bin/repo
+          sudo ln -sf ~/bin/repo /usr/bin/repo
+
+      - name: Sync Sources
+        run: |
+          mkdir android && cd android
+          repo init -u https://github.com/LineageOS/android.git -b lineage-16.0 --depth=1
+          mkdir -p .repo/local_manifests
+          cat <<EOF > .repo/local_manifests/y560.xml
+          <?xml version="1.0" encoding="UTF-8"?>
+          <manifest>
+            <project name="KonstaT/android_device_huawei_y560" path="device/huawei/y560" remote="github" revision="cm-14.1" />
+            <project name="KonstaT/android_kernel_huawei_msm8909" path="kernel/huawei/y560" remote="github" revision="cm-14.1" />
+            <project name="KonstaT/proprietary_vendor_huawei" path="vendor/huawei/tmp" remote="github" revision="cm-14.1" />
+          </manifest>
+          EOF
+          repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+          rm -rf development/samples
+
+      - name: Mock Toolchain
+        run: |
+          cd android
+          mkdir -p prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin
+          ln -sf /usr/bin/arm-linux-gnueabi-gcc prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin/arm-eabi-gcc
+          ln -sf /usr/bin/arm-linux-gnueabi-objdump prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin/arm-eabi-objdump
+          ln -sf /usr/bin/arm-linux-gnueabi-ar  prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin/arm-eabi-ar
+          ln -sf /usr/bin/arm-linux-gnueabi-ld  prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin/arm-eabi-ld
+          ln -sf /usr/bin/arm-linux-gnueabi-nm  prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin/arm-eabi-nm
+          ln -sf /usr/bin/arm-linux-gnueabi-objcopy prebuilts/gcc/linux-x86/arm/arm-eabi-4.8/bin/arm-eabi-objcopy
+
+      - name: Apply All Fixes
+        run: |
+          cd android
+
+          # 1. Vendor & Folders Setup
+          mkdir -p vendor/huawei/y560
+          if [ -d "vendor/huawei/tmp/y560" ]; then
+            cp -r vendor/huawei/tmp/y560/* vendor/huawei/y560/
+            rm -rf vendor/huawei/tmp
+          fi
+
+          # 2. Device Tree Fixes
+          cd device/huawei/y560
+          [ -f "cm.mk" ] && mv cm.mk lineage_y560.mk
+          [ -f "lineage.mk" ] && mv lineage.mk lineage_y560.mk
+          [ -f "full_y560.mk" ] && mv full_y560.mk lineage_y560.mk
+
+          # Private Platform APIs fix for Doze
+          if [ -f "doze/Android.mk" ]; then
+            sed -i '/LOCAL_MODULE_TAGS/a LOCAL_PRIVATE_PLATFORM_APIS := true' doze/Android.mk
+          fi
+
+          # Recréation propre des Makefiles
+          echo "PRODUCT_MAKEFILES := \$(LOCAL_DIR)/lineage_y560.mk" > AndroidProducts.mk
+          echo "COMMON_LUNCH_CHOICES := lineage_y560-userdebug" >> AndroidProducts.mk
+
+          # Nettoyage BoardConfig (Récupération des 5 lignes perdues)
+          sed -i '/TARGET_GLOBAL_CFLAGS/d' BoardConfig.mk
+          sed -i '/TARGET_GLOBAL_CPPFLAGS/d' BoardConfig.mk
+          sed -i '/BOARD_KERNEL_IMAGE_NAME/d' BoardConfig.mk
+          sed -i '/TARGET_KERNEL_SOURCE/d' BoardConfig.mk
+          sed -i '/TARGET_KERNEL_CONFIG/d' BoardConfig.mk
+          echo 'BOARD_KERNEL_IMAGE_NAME := zImage-dtb' >> BoardConfig.mk
+          echo 'TARGET_KERNEL_SOURCE := kernel/huawei/y560' >> BoardConfig.mk
+          echo 'TARGET_KERNEL_CONFIG := y560_defconfig' >> BoardConfig.mk
+
+          # 3. Global Replacement CM -> Lineage
+          cd ../../../
+          find device/huawei/y560 vendor/huawei/y560 -type f \( -name "*.mk" -o -name "*.java" -o -name "Android.mk" \) -exec sed -i 's/vendor\/cm/vendor\/lineage/g' {} +
+          find device/huawei/y560 vendor/huawei/y560 -type f \( -name "*.mk" -o -name "*.java" -o -name "Android.mk" \) -exec sed -i 's/org.cyanogenmod.platform/org.lineageos.platform/g' {} +
+
+          # 4. Kernel Patching (Deep Fixes)
+          cd kernel/huawei/y560
+
+          # Fix GCC 11 headers
+          mkdir -p include/linux
+          cp include/linux/compiler-gcc4.h include/linux/compiler-gcc11.h 2>/dev/null || true
+
+          # Fix log2 attributes
+          sed -i 's/__attribute__((noreturn, const))/__attribute__((const))/g' include/linux/log2.h
+          sed -i 's/__attribute__((const, noreturn))/__attribute__((const))/g' include/linux/log2.h
+
+          # FIX FORK.O (Neutralisation macro .err de l'assembleur)
+          find . -type f -name "*.S" -exec sed -i 's/^\s*\.err/\/\/ .err/g' {} +
+          [ -f "arch/arm/kernel/calls.S" ] && sed -i 's/\.err/.warning/g' arch/arm/kernel/calls.S
+
+          # FIX RETURN_ADDRESS & FTRACE
+          sed -i 's/extern inline void \*return_address/static inline void \*return_address/g' arch/arm/include/asm/ftrace.h
+          sed -i 's/^void \*return_address/static __attribute__((unused)) void \*return_address_unused/g' arch/arm/kernel/return_address.c
+
+          # Massive Suppression of -Werror and Forbidden Warnings
+          find . -type f -name "Makefile*" -exec sed -i 's/-Werror//g' {} +
+          find . -type f -name "Kbuild*" -exec sed -i 's/-Werror//g' {} +
+          find . -type f -exec sed -i 's/error, forbidden warning//g' {} +
+          find . -type f -name "Makefile*" -exec sed -i 's/-implicit-function-declaration/-Wimplicit-function-declaration/g' {} +
+
+          # DTC yylloc Fix
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.l 2>/dev/null || true
+          sed -i 's/^YYLTYPE yylloc;/extern YYLTYPE yylloc;/g' scripts/dtc/dtc-lexer.lex.c_shipped 2>/dev/null || true
+
+          # Injection de flags MSM (dma.c, smcmod.c)
+          echo "ccflags-y += -Wno-format-truncation -Wno-stringop-truncation -Wno-address-of-packed-member -Wno-error" >> arch/arm/mach-msm/Makefile
+
+          # Global Makefile Flags
+          sed -i 's/^HOSTCFLAGS   :=/HOSTCFLAGS   := -fcommon/g' Makefile
+          sed -i '/^ARCH_CPPFLAGS/a KBUILD_CFLAGS += -fcommon -Wno-attributes -Wno-error -Wno-format-truncation -Wno-maybe-uninitialized -Wno-unused-function -Wno-stringop-truncation -Wno-return-type -Wno-address-of-packed-member' Makefile
+
+          # Config setup
+          cp arch/arm/configs/msm8909_defconfig arch/arm/configs/y560_defconfig 2>/dev/null || cp arch/arm/configs/msm_defconfig arch/arm/configs/y560_defconfig
+
+      - name: Build ROM
+        run: |
+          cd android
+          source build/envsetup.sh
+          export TEMPORARY_DISABLE_PATH_RESTRICTIONS=true
+          export ALLOW_MISSING_DEPENDENCIES=true
+          export WITHOUT_CHECK_API=true
+          export LC_ALL=C
+          lunch lineage_y560-userdebug
+          make bacon -j4
+
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LineageOS-16-Y560
+          path: |
+            android/out/target/product/y560/*.zip
+            android/out/target/product/y560/boot.img
